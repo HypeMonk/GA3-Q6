@@ -1,0 +1,526 @@
+# GA3 — Q6 Standalone Guide (Korean Audio → Dataset Statistics)
+
+A single self-contained FastAPI app that answers **only Q6**. Deploy it **anywhere**
+that can serve an HTTPS URL — Hugging Face Spaces, Render, Railway, Fly.io, a VPS,
+or your own laptop exposed with **ngrok** / **Cloudflare Tunnel**. Then submit the
+public URL (ending in `/answer-audio`) for Q6.
+
+---
+
+## 1. What Q6 actually asks (in plain terms)
+
+The grader sends your endpoint a **Korean audio clip**. The voice describes a small
+data table and either **states** some statistics or **asks** you to generate rows
+with certain properties. Example (translated):
+
+> *"Generate 120 rows of JSON data. The columns are age and income. The mean of age
+> is 30 and the standard deviation is 5."*
+
+Your job: return a **JSON object** with the dataset's shape and **exactly the
+statistics the audio mentioned** — no more, no less. The grader compares your JSON
+to its own seeded answer key with an **exact key-set match**. If you include a stat
+it didn't ask for, or miss one it did, you fail — even if the numbers are right.
+
+### What we do to solve it (3 steps)
+1. **Transcribe** the audio to Korean text (using Gemini 2.5 Flash Lite through
+   AIPipe — OpenAI's transcription route via AIPipe is broken, Gemini isn't).
+2. **Extract** structure with GPT-4o: column names, row count, and which statistics
+   were stated/requested (mapping Korean stat words → `mean/std/median/...`).
+3. **Assemble** the response deterministically in Python and **trim it to the exact
+   set of statistics** the audio referenced, so the grader's key-set check passes
+   both ways.
+
+The tricky part (and why students fail) is step 3: the model files the same value
+under different keys (`min/max` vs `value_range`), forgets to list a column, or adds
+stats nobody asked for. The code below fixes all of those deterministically.
+
+---
+
+## 2. The one file — `main.py`
+
+> Fill in the **two values at the top** (`EMAIL`, `AIPIPE_TOKEN`). Nothing else to change.
+
+```python
+# main.py  — Q6 only. Self-contained: no config.py, no other files needed.
+import json, re, base64, hashlib
+from statistics import mean, median, pstdev, pvariance, mode
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+
+# ======= FILL THESE TWO IN =======
+EMAIL = "your_email@ds.study.iitm.ac.in"
+AIPIPE_TOKEN = "PASTE_YOUR_AIPIPE_TOKEN"
+# ==================================
+AIPIPE_BASE = "https://aipipe.org/openai/v1"
+
+app = FastAPI()
+# CORS wide open — the grader calls from a Cloudflare Worker (browser fetch).
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+    allow_headers=["*"], allow_credentials=False,
+)
+HEAD = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
+
+# --- tiny cache so the grader re-checking the same audio doesn't cost twice ---
+_CACHE = {}
+def _ck(*parts):
+    return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
+
+async def chat(messages, model="gpt-4o", max_tokens=1500):
+    key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
+    if key in _CACHE:
+        return _CACHE[key]
+    body = {"model": model, "messages": messages, "temperature": 0,
+            "max_tokens": max_tokens, "response_format": {"type": "json_object"}}
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(f"{AIPIPE_BASE}/chat/completions", headers=HEAD, json=body)
+        r.raise_for_status()
+        out = r.json()["choices"][0]["message"]["content"]
+    _CACHE[key] = out
+    return out
+
+def parse_json(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
+
+@app.get("/")
+async def root():
+    return {"ok": True, "email": EMAIL, "endpoint": "/answer-audio"}
+
+# ================= Q6 state + DEBUG ENDPOINTS =================
+last_debug_info = {}
+last_audio_bytes = b""          # raw audio the grader last sent (for download)
+last_audio_mime = "audio/wav"
+audio_history = []              # every Q6 call this session (transcript + result)
+
+@app.get("/debug")
+def get_debug():
+    """The LAST call in full detail: content-type, keys, magic bytes, detected
+    mime, transcript, raw LLM output, and any exception."""
+    return last_debug_info
+
+@app.get("/transcripts")
+def get_transcripts():
+    """Full history of EVERY audio the grader sent this session — each with its
+    transcript, the LLM's raw extraction, and the final answer we returned.
+    Newest first. Open in a browser."""
+    return {"count": len(audio_history), "calls": list(reversed(audio_history))}
+
+@app.get("/last-audio")
+def get_last_audio():
+    """Download the EXACT audio file the grader last posted, so you can LISTEN to
+    it and see its real format."""
+    from fastapi.responses import Response
+    ext = {"audio/mp3": "mp3", "audio/ogg": "ogg", "audio/flac": "flac",
+           "audio/wav": "wav", "audio/mpeg": "mp3", "audio/webm": "webm",
+           "audio/mp4": "m4a"}.get(last_audio_mime, "bin")
+    return Response(
+        content=last_audio_bytes, media_type=last_audio_mime,
+        headers={"Content-Disposition": f'attachment; filename="q6_audio.{ext}"'})
+
+def _find_audio_b64(body):
+    """The grader's key names aren't guaranteed. Scan the JSON body for the audio
+    id and the base64 blob no matter what they're called."""
+    audio_id, audio_b64 = None, ""
+    if isinstance(body, dict):
+        for k, v in body.items():
+            lk = str(k).lower()
+            if isinstance(v, str):
+                if ("audio" in lk or "data" in lk or "b64" in lk or "base64" in lk) and len(v) > 200:
+                    if len(v) > len(audio_b64):
+                        audio_b64 = v
+                elif "id" in lk and not audio_id:
+                    audio_id = v
+    return audio_id, audio_b64
+
+# ================= Q6: /answer-audio =================
+@app.post("/answer-audio")
+async def answer_audio(request: Request):
+    global last_debug_info, last_audio_bytes, last_audio_mime
+
+    # --- Capture the FULL raw request regardless of key names or JSON vs multipart ---
+    raw = await request.body()
+    ctype = request.headers.get("content-type", "")
+    last_debug_info = {"content_type": ctype, "raw_len": len(raw)}
+
+    body, audio_id, audio_b64 = {}, None, ""
+    try:
+        if "application/json" in ctype or raw[:1] in (b"{", b"["):
+            body = json.loads(raw)
+            last_debug_info["body_keys"] = list(body.keys()) if isinstance(body, dict) else "non-dict"
+            audio_id, audio_b64 = _find_audio_b64(body)
+        else:
+            try:
+                form = await request.form()
+                last_debug_info["form_keys"] = list(form.keys())
+                for k, v in form.items():
+                    data = await v.read() if hasattr(v, "read") else None
+                    if data:
+                        last_audio_bytes = data
+            except Exception:
+                pass
+            if not last_audio_bytes and raw:
+                last_audio_bytes = raw
+            audio_b64 = base64.b64encode(last_audio_bytes).decode() if last_audio_bytes else ""
+    except Exception as e:
+        last_debug_info["parse_error"] = str(e)
+
+    last_debug_info["body_id"] = audio_id
+    last_debug_info["audio_b64_len"] = len(audio_b64)
+    transcript = ""
+    try:
+        audio = base64.b64decode(audio_b64) if audio_b64 else last_audio_bytes
+        last_audio_bytes = audio
+        last_debug_info["magic_bytes"] = audio[:16].hex()
+
+        # Detect the real audio format from magic bytes (hardcoding mp3 breaks
+        # students whose seeded audio is WAV/OGG/FLAC/WEBM/M4A).
+        if audio.startswith(b"ID3") or audio[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+            mime = "audio/mp3"
+        elif audio.startswith(b"OggS"):
+            mime = "audio/ogg"
+        elif audio.startswith(b"fLaC"):
+            mime = "audio/flac"
+        elif audio.startswith(b"RIFF") and audio[8:12] == b"WAVE":
+            mime = "audio/wav"
+        elif audio.startswith(b"\x1aE\xdf\xa3"):
+            mime = "audio/webm"
+        elif audio[4:8] == b"ftyp":
+            mime = "audio/mp4"
+        else:
+            mime = "audio/wav"
+        last_audio_mime = mime
+        last_debug_info["detected_mime"] = mime
+
+        async with httpx.AsyncClient(timeout=120) as c:
+            # AIPipe's OpenAI /audio/transcriptions is broken; Gemini handles audio in JSON.
+            payload = {"contents": [{"parts": [
+                {"text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
+                {"inlineData": {"mimeType": mime, "data": audio_b64}}]}]}
+            r = await c.post("https://aipipe.org/geminiv1beta/models/gemini-2.5-flash-lite:generateContent",
+                             headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"}, json=payload)
+            r.raise_for_status()
+            gemini_resp = r.json()
+            try:
+                transcript = gemini_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (KeyError, IndexError):
+                transcript = ""
+    except httpx.HTTPStatusError as e:
+        transcript = ""
+        last_debug_info["exception"] = f"HTTP {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        transcript = ""
+        last_debug_info["exception"] = str(e)
+
+    last_debug_info["transcript"] = transcript
+
+    # Step 1: GPT-4o extracts structure + which statistics were stated/requested.
+    prompt = (
+        "The transcript (Korean) describes a tabular dataset and asks for or states specific statistics. "
+        "Extract the raw data, schema, and identify/extract the exact statistics.\n"
+        "If the transcript only ASKS to generate data (e.g., 'Generate 140 rows. The median of income is 45000'), do NOT invent data. "
+        "Instead, extract the column names into 'columns', return the requested number of rows in 'num_rows', and leave 'data_rows' empty. "
+        "ALSO, if it explicitly mentions any constraints or known statistical values (like mean, median, value ranges or allowed values), extract them into 'explicit_stats'.\n\n"
+        "Korean to English Statistic Mapping Guide:\n"
+        "- '평균' -> 'mean'\n"
+        "- '표준편차' -> 'std'\n"
+        "- '분산' -> 'variance'\n"
+        "- '최소' / '최솟값' -> 'min'\n"
+        "- '최대' / '최댓값' -> 'max'\n"
+        "- '중앙값' / '중간값' -> 'median'\n"
+        "- '최빈값' -> 'mode'\n"
+        "- '범위' -> 'range'\n"
+        "- '~사이' (between A and B) -> 'value_range'\n"
+        "- '허용값' / '허용된 값' -> 'allowed_values'\n"
+        "- '상관관계' -> 'correlation' ('양의'/비례 = positive, '음의'/반비례 = negative)\n\n"
+        "Return ONLY valid JSON:\n"
+        "{\n"
+        "  \"columns\": [\"column_name\"],  // MUST extract column names even if no data is provided\n"
+        "  \"data_rows\": [[val1], [val2], ...],  // leave empty if no actual data provided\n"
+        "  \"num_rows\": 140, // ONLY use this if the transcript specifies a row count but provides NO data. Otherwise null.\n"
+        "  \"explicit_stats\": {\n"
+        "    \"value_range\": {\"점수\": [0, 100]},\n"
+        "    \"median\": {\"소득\": 45000},\n"
+        "    \"mean\": {\"온도\": 22},\n"
+        "    \"std\": {\"온도\": 3},\n"
+        "    \"correlation\": [{\"x\": \"키\", \"y\": \"몸무게\", \"type\": \"positive\"}]\n"
+        "  },\n"
+        "  \"requested_stats\": [\"median\"]  // Choose ONLY from the allowed list: mean, std, variance, min, max, median, mode, range, allowed_values, value_range, correlation. If none specifically asked, return all.\n"
+        "}\n"
+        "CRITICAL RULES:\n"
+        "1. DO NOT confuse '중간값'/'중앙값' (median) with '평균' (mean). Map them carefully using the mapping guide above.\n"
+        "2. DO NOT invent data. Extract all rows exactly as dictated.\n"
+        "3. Keep column names exactly as spoken.\n"
+        "4. allowed_values is ONLY for CATEGORICAL columns whose text explicitly lists "
+        "a fixed permitted set (e.g. '허용값: A, B, C'). For numeric columns like "
+        "나이/몸무게/키/점수/소득 (age/weight/height/score/income), NEVER emit allowed_values — "
+        "leave it out entirely. Only put it in requested_stats/explicit_stats if the "
+        "audio literally says '허용값'/'허용된 값'.\n"
+        "5. correlation MUST be a LIST of objects {\"x\": colA, \"y\": colB, \"type\": "
+        "\"positive\"|\"negative\"} — one per stated relationship. When the audio says "
+        "'A와 B는 양의 상관관계' put both column names in 'columns' AND emit "
+        "explicit_stats.correlation=[{\"x\":\"A\",\"y\":\"B\",\"type\":\"positive\"}]. "
+        "'양의'/비례=positive, '음의'/반비례=negative. NEVER output a correlation matrix.\n\n"
+        f"TRANSCRIPT:\n{transcript}"
+    )
+    columns, data_rows, req_stats, num_rows, explicit_stats = [], [], [], None, {}
+    try:
+        raw_llm = await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500)
+        last_debug_info["raw_llm"] = raw_llm
+        ext = parse_json(raw_llm)
+        columns = ext.get("columns", []) or []
+        data_rows = ext.get("data_rows", []) or []
+        req_stats = ext.get("requested_stats", [])
+        num_rows = ext.get("num_rows")
+        explicit_stats = ext.get("explicit_stats", {})
+    except Exception:
+        pass
+
+    # The model often names a column ONLY inside explicit_stats and forgets to list
+    # it in `columns`. The grader checks `columns` strictly -> rebuild it.
+    referenced = []
+    for sd in (explicit_stats or {}).values():
+        if isinstance(sd, dict):
+            for k in sd:
+                if k not in referenced:
+                    referenced.append(k)
+    for c in referenced:
+        if c not in columns:
+            columns.append(c)
+
+    if not req_stats:
+        req_stats = ["mean", "std", "variance", "min", "max", "median", "mode", "range", "allowed_values", "value_range", "correlation"]
+
+    actual_rows = num_rows if num_rows is not None else len(data_rows)
+    out = {"rows": actual_rows, "columns": columns,
+           "mean": {}, "std": {}, "variance": {}, "min": {}, "max": {},
+           "median": {}, "mode": {}, "range": {}, "allowed_values": {},
+           "value_range": {}, "correlation": []}
+
+    def col_values(ci):
+        vals = []
+        for r in data_rows:
+            try:
+                vals.append(float(r[ci]))
+            except Exception:
+                pass
+        return vals
+
+    # If ACTUAL data rows were dictated, compute every requested stat from them.
+    cols_vals = []
+    for ci, name in enumerate(columns):
+        v = col_values(ci)
+        if not v:
+            continue
+        cols_vals.append(v)
+        if "mean" in req_stats: out["mean"][name] = mean(v)
+        if "std" in req_stats: out["std"][name] = pstdev(v) if len(v) > 1 else 0.0
+        if "variance" in req_stats: out["variance"][name] = pvariance(v) if len(v) > 1 else 0.0
+        if "min" in req_stats: out["min"][name] = min(v)
+        if "max" in req_stats: out["max"][name] = max(v)
+        if "median" in req_stats: out["median"][name] = median(v)
+        if "mode" in req_stats:
+            try: out["mode"][name] = mode(v)
+            except: out["mode"][name] = v[0]
+        if "range" in req_stats: out["range"][name] = max(v) - min(v)
+        if "value_range" in req_stats: out["value_range"][name] = [min(v), max(v)]
+
+    # ---- Correlation: grader wants a LIST of {x, y, type}, NOT a numeric matrix. ----
+    def _corr_type(tr, hint=""):
+        h = str(hint).lower()
+        if h in ("positive", "negative"):
+            return h
+        t = (tr or "")
+        if "음의" in t or "반비례" in t or "negative" in t.lower():
+            return "negative"
+        return "positive"
+
+    corr_list = []
+    raw_corr = explicit_stats.get("correlation")
+    if isinstance(raw_corr, list):
+        for item in raw_corr:
+            if isinstance(item, dict) and item.get("x") and item.get("y"):
+                corr_list.append({"x": item["x"], "y": item["y"],
+                                  "type": _corr_type(transcript, item.get("type", ""))})
+    elif isinstance(raw_corr, dict):
+        for x, y in raw_corr.items():
+            if isinstance(y, str) and y:
+                corr_list.append({"x": x, "y": y, "type": _corr_type(transcript)})
+    if not corr_list and cols_vals and len(columns) > 1 and all(cols_vals) and "correlation" in req_stats:
+        import math
+        for i in range(len(columns)):
+            for j in range(i + 1, len(columns)):
+                a, b = cols_vals[i], cols_vals[j]
+                if len(a) == len(b) and len(a) > 1:
+                    ma, mb = mean(a), mean(b)
+                    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+                    corr_list.append({"x": columns[i], "y": columns[j],
+                                      "type": "negative" if num < 0 else "positive"})
+    if corr_list:
+        out["correlation"] = corr_list
+
+    # ---- Decide the EXACT set of stats the grader wants (the whole ballgame). ----
+    # requested_stats == the FULL list is the model's "only a constraint was stated,
+    # nothing specific asked" signal -> return EXACTLY what's in explicit_stats.
+    # A SPECIFIC short list (e.g. 최솟값/최댓값 -> ["min","max"]) is the authority.
+    FULL = ["mean", "std", "variance", "min", "max", "median", "mode",
+            "range", "allowed_values", "value_range", "correlation"]
+    has_data = len(data_rows) > 0
+
+    def _present(s):
+        v = explicit_stats.get(s)
+        return (isinstance(v, dict) and bool(v)) or (isinstance(v, list) and bool(v))
+
+    if req_stats and set(req_stats) != set(FULL):
+        target = [s for s in FULL if s in req_stats]
+    elif has_data:
+        target = list(FULL)
+    else:
+        target = [s for s in FULL if _present(s)]
+
+    # Cross-populate min/max/range/value_range ONLY toward keys the grader asked for
+    # (the model files 최솟값/최댓값 under value_range and vice-versa).
+    vr = explicit_stats.get("value_range")
+    if isinstance(vr, dict):
+        for col, bounds in vr.items():
+            if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+                lo, hi = bounds[0], bounds[1]
+                if "min" in target: explicit_stats.setdefault("min", {}).setdefault(col, lo)
+                if "max" in target: explicit_stats.setdefault("max", {}).setdefault(col, hi)
+                if "range" in target:
+                    try: explicit_stats.setdefault("range", {}).setdefault(col, hi - lo)
+                    except Exception: pass
+    emin, emax = explicit_stats.get("min"), explicit_stats.get("max")
+    if isinstance(emin, dict) and isinstance(emax, dict):
+        for col in emin:
+            if col in emax:
+                if "value_range" in target:
+                    explicit_stats.setdefault("value_range", {}).setdefault(col, [emin[col], emax[col]])
+                if "range" in target:
+                    try: explicit_stats.setdefault("range", {}).setdefault(col, emax[col] - emin[col])
+                    except Exception: pass
+
+    # Merge every explicit stat into the output.
+    for stat_name, stat_dict in explicit_stats.items():
+        if stat_name in out and isinstance(out[stat_name], dict) and isinstance(stat_dict, dict):
+            out[stat_name].update(stat_dict)
+
+    # Trim to EXACTLY the target key set (no missing keys, no leaked siblings).
+    for k in FULL:
+        if k == "correlation":
+            continue
+        if k not in target:
+            out[k] = {}
+    if "correlation" not in target:
+        out["correlation"] = []
+
+    # Record this call in the history (cap 50 so memory stays bounded).
+    audio_history.append({
+        "audio_id": last_debug_info.get("body_id"),
+        "detected_mime": last_debug_info.get("detected_mime"),
+        "transcript": transcript,
+        "raw_llm": last_debug_info.get("raw_llm"),
+        "requested_stats": req_stats,
+        "target_keys": target,
+        "answer": out,
+    })
+    if len(audio_history) > 50:
+        del audio_history[0]
+    return out
+```
+
+### `requirements.txt`
+```text
+fastapi
+uvicorn[standard]
+httpx
+```
+
+Run locally with:
+```bash
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 7860
+```
+
+---
+
+## 3. The 3 debug endpoints (this is what makes Q6 winnable)
+
+Because the grader POSTs the audio **to your own server**, you are allowed to log
+exactly what it sends. After you click **Check** on Q6, open these in a browser:
+
+| Endpoint | What it shows | Use it to… |
+| :--- | :--- | :--- |
+| **`/last-audio`** | **Downloads the exact audio file** the grader last sent (`q6_audio.mp3` etc.) | **Listen to it.** Hear the real Korean — the true column names, numbers, and which statistic was actually said. This is your ground truth. |
+| **`/debug`** | The **last** call in full: `content_type`, `body_keys`, `magic_bytes`, `detected_mime`, the `transcript`, the raw GPT‑4o JSON (`raw_llm`), and any `exception`. | See *where* it broke — bad format? empty transcript? wrong extraction? |
+| **`/transcripts`** | The **full history** of every audio this session — each with its `transcript`, `raw_llm`, `requested_stats`, `target_keys`, and final `answer`. Newest first. | The grader checks several audios in a row; `/debug` only keeps the last one. This keeps **all** of them so you can find the exact query that failed. |
+
+**Debugging workflow when a student fails Q6:**
+1. Open **`/last-audio`** → listen. Note the real columns / numbers / stat word.
+2. Open **`/transcripts`** → find that call. Compare its `transcript` to what you heard
+   (was transcription wrong?) and its `target_keys` / `answer` to what the grader wanted
+   (was the stat filed under the wrong key?).
+3. That pinpoints the fix — no more blind guessing.
+
+> These endpoints are only visible to you (you open the URL yourself). They don't
+> affect grading; the grader only calls `POST /answer-audio`.
+
+---
+
+## 4. Deploy it — pick any host
+
+You only need a **public HTTPS URL**. Options, easiest first:
+
+### Option A — Hugging Face Spaces (free, always-on)
+1. Create a **Space** → SDK **Docker** → Blank.
+2. Add `main.py`, `requirements.txt`, and this `Dockerfile`:
+   ```dockerfile
+   FROM python:3.11-slim
+   WORKDIR /app
+   COPY requirements.txt .
+   RUN pip install --no-cache-dir -r requirements.txt
+   COPY . .
+   EXPOSE 7860
+   CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+   ```
+3. Wait for **Running**. URL: `https://<user>-<space>.hf.space`.
+
+### Option B — Render / Railway / Fly.io (free tiers)
+- New **Web Service** from your repo (the 3 files).
+- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Use their auto-assigned HTTPS URL.
+
+### Option C — Your laptop + a tunnel (fastest to test)
+Run locally (`uvicorn main:app --port 7860`), then expose it:
+- **ngrok:** `ngrok http 7860` → use the `https://xxxx.ngrok-free.app` URL.
+- **Cloudflare Tunnel:** `cloudflared tunnel --url http://localhost:7860`
+  → use the printed `https://xxxx.trycloudflare.com` URL.
+
+> ⚠️ With a laptop tunnel, keep the terminal **open** the whole time you Check/Submit.
+> If you close it the URL dies and grading fails. HF/Render stay up on their own.
+
+---
+
+## 5. Submit
+
+- **Submit for Q6:** `https://<your-host>/answer-audio`  *(the full path, not just the base)*
+- Click **Check**. If it fails, open `/last-audio`, `/debug`, `/transcripts` and fix.
+- When it says **Correct**, click **Submit**. Keep the host **Running** until done.
+
+### Quick checks
+- Base URL `https://<your-host>/` should return `{"ok": true, "email": "...", ...}`.
+- **CORS** is already wide-open (grader calls from a browser Worker) — don't change it.
+- **Cost:** the in-memory cache means a re-Check of the same audio is free. Gemini
+  Flash‑Lite + GPT‑4o for one short clip is a fraction of a cent; 100 cents/week is
+  ample. Check usage at `https://aipipe.org/usage`.
+- **Empty transcript** in `/debug`? Open `/last-audio` — if the file won't play, the
+  grader sent an unexpected format; the `detected_mime`/`magic_bytes` fields tell you
+  what it actually was.
+```
