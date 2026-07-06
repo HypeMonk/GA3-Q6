@@ -258,11 +258,14 @@ async def answer_audio(request: Request):
         "1. DO NOT confuse '중간값'/'중앙값' (median) with '평균' (mean). Map them carefully using the mapping guide above.\n"
         "2. DO NOT invent data. Extract all rows exactly as dictated.\n"
         "3. Keep column names exactly as spoken.\n"
-        "4. allowed_values is ONLY for CATEGORICAL columns whose text explicitly lists "
-        "a fixed permitted set (e.g. '허용값: A, B, C'). For numeric columns like "
-        "나이/몸무게/키/점수/소득 (age/weight/height/score/income), NEVER emit allowed_values — "
-        "leave it out entirely. Only put it in requested_stats/explicit_stats if the "
-        "audio literally says '허용값'/'허용된 값'.\n"
+        "4. allowed_values is for CATEGORICAL columns whose text explicitly lists a "
+        "fixed permitted set. This is triggered by EITHER '허용값'/'허용된 값' OR a "
+        "'one-of' enumeration: '<col>는/은 A, B, C 중 하나입니다' (col is one of A,B,C), "
+        "'<col>는 상/중/하 중 하나', '또는'/'혹은' choices, etc. In those cases emit "
+        "explicit_stats.allowed_values={\"<col>\": [\"A\",\"B\",\"C\"]} AND put <col> in "
+        "'columns' AND put 'allowed_values' in requested_stats. For purely numeric "
+        "columns like 나이/몸무게/키/점수/소득 with NO listed category set, NEVER emit "
+        "allowed_values.\n"
         "5. correlation MUST be a LIST of objects {\"x\": colA, \"y\": colB, \"type\": "
         "\"positive\"|\"negative\"} — one per stated relationship. When the audio says "
         "'A와 B는 양의 상관관계' put both column names in 'columns' AND emit "
@@ -282,6 +285,36 @@ async def answer_audio(request: Request):
         explicit_stats = ext.get("explicit_stats", {})
     except Exception:
         pass
+
+    # Deterministic safety net for allowed_values (categorical 'one-of' sets). The
+    # model frequently drops these entirely, e.g. "카테고리는 A, B, C 중 하나입니다"
+    # -> allowed_values={카테고리:[A,B,C]}.
+    def _extract_allowed_values(tr):
+        found = {}
+        if not tr:
+            return found
+        for m in re.finditer(r"([가-힣A-Za-z0-9_]+?)(?:는|은|이|가)\s+([^.。\n]+?)\s*중\s*(?:하나|에서)", tr):
+            col = m.group(1).strip()
+            vals = [v.strip() for v in re.split(r"[,、/]|또는|혹은", m.group(2)) if v.strip()]
+            if col and len(vals) >= 2:
+                found[col] = vals
+        for m in re.finditer(r"([가-힣A-Za-z0-9_]+?)(?:의|는|은)?\s*허용(?:값|된\s*값)[은는]?\s*[:：]?\s*([^.。\n]+)", tr):
+            col = m.group(1).strip()
+            rawv = re.sub(r"(입니다|이다)\s*$", "", m.group(2).strip())
+            vals = [v.strip() for v in re.split(r"[,、/]|또는|혹은", rawv) if v.strip()]
+            if col and vals:
+                found[col] = vals
+        return found
+
+    av = _extract_allowed_values(transcript)
+    if av:
+        es_av = explicit_stats.setdefault("allowed_values", {})
+        for col, vals in av.items():
+            es_av.setdefault(col, vals)
+        if "allowed_values" not in req_stats and set(req_stats) != set(
+                ["mean", "std", "variance", "min", "max", "median", "mode",
+                 "range", "allowed_values", "value_range", "correlation"]):
+            req_stats.append("allowed_values")
 
     # The model often names a column ONLY inside explicit_stats and forgets to list
     # it in `columns`. The grader checks `columns` strictly -> rebuild it.
