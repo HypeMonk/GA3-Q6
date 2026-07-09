@@ -67,18 +67,57 @@ _CACHE = {}
 def _ck(*parts):
     return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
 
-async def chat(messages, model="gpt-4o", max_tokens=1500):
+import asyncio
+async def chat(messages, model="gpt-4o", max_tokens=1500, retries=4):
     key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
     if key in _CACHE:
         return _CACHE[key]
     body = {"model": model, "messages": messages, "temperature": 0,
             "max_tokens": max_tokens, "response_format": {"type": "json_object"}}
+    last_err = None
     async with httpx.AsyncClient(timeout=90) as c:
-        r = await c.post(f"{AIPIPE_BASE}/chat/completions", headers=HEAD, json=body)
-        r.raise_for_status()
-        out = r.json()["choices"][0]["message"]["content"]
-    _CACHE[key] = out
-    return out
+        for attempt in range(retries):
+            r = await c.post(f"{AIPIPE_BASE}/chat/completions", headers=HEAD, json=body)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}: {r.text[:160]}"
+                await asyncio.sleep(1.5 * (attempt + 1))   # backoff and retry
+                continue
+            r.raise_for_status()
+            out = r.json()["choices"][0]["message"]["content"]
+            _CACHE[key] = out
+            return out
+    raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
+
+# Gemini models to try in order for transcription — retry each on 503/429, then
+# fall through to the next when one is overloaded.
+GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash",
+                 "gemini-flash-latest"]
+
+async def gemini_transcribe(payload, debug, attempts_per_model=3):
+    last_err = ""
+    async with httpx.AsyncClient(timeout=120) as c:
+        for model in GEMINI_MODELS:
+            for attempt in range(attempts_per_model):
+                try:
+                    r = await c.post(
+                        f"https://aipipe.org/geminiv1beta/models/{model}:generateContent",
+                        headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"}, json=payload)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        last_err = f"HTTP {r.status_code} on {model}: {r.text[:160]}"
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    r.raise_for_status()
+                    txt = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    debug["transcribe_model"] = model
+                    return txt
+                except (KeyError, IndexError):
+                    last_err = f"empty candidates on {model}"
+                    break
+                except Exception as e:
+                    last_err = f"{type(e).__name__} on {model}: {str(e)[:160]}"
+                    await asyncio.sleep(1.0 * (attempt + 1))
+    debug["transcribe_error"] = last_err
+    return ""
 
 def parse_json(s):
     s = s.strip()
@@ -199,22 +238,12 @@ async def answer_audio(request: Request):
         last_audio_mime = mime
         last_debug_info["detected_mime"] = mime
 
-        async with httpx.AsyncClient(timeout=120) as c:
-            # AIPipe's OpenAI /audio/transcriptions is broken; Gemini handles audio in JSON.
-            payload = {"contents": [{"parts": [
-                {"text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
-                {"inlineData": {"mimeType": mime, "data": audio_b64}}]}]}
-            r = await c.post("https://aipipe.org/geminiv1beta/models/gemini-2.5-flash-lite:generateContent",
-                             headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"}, json=payload)
-            r.raise_for_status()
-            gemini_resp = r.json()
-            try:
-                transcript = gemini_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
-            except (KeyError, IndexError):
-                transcript = ""
-    except httpx.HTTPStatusError as e:
-        transcript = ""
-        last_debug_info["exception"] = f"HTTP {e.response.status_code}: {e.response.text}"
+        # AIPipe's OpenAI /audio/transcriptions is broken; Gemini handles audio in
+        # JSON. Gemini can 503 ("overloaded") under load -> retry + model fallback.
+        payload = {"contents": [{"parts": [
+            {"text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
+            {"inlineData": {"mimeType": mime, "data": audio_b64}}]}]}
+        transcript = await gemini_transcribe(payload, last_debug_info)
     except Exception as e:
         transcript = ""
         last_debug_info["exception"] = str(e)
@@ -270,7 +299,11 @@ async def answer_audio(request: Request):
         "\"positive\"|\"negative\"} — one per stated relationship. When the audio says "
         "'A와 B는 양의 상관관계' put both column names in 'columns' AND emit "
         "explicit_stats.correlation=[{\"x\":\"A\",\"y\":\"B\",\"type\":\"positive\"}]. "
-        "'양의'/비례=positive, '음의'/반비례=negative. NEVER output a correlation matrix.\n\n"
+        "'양의'/비례=positive, '음의'/반비례=negative. NEVER output a correlation matrix.\n"
+        "6. If the transcript states a constraint like '값은 0에서 1 사이입니다', you MUST "
+        "extract the subject ('값', '점수', etc.) as the column name into the 'columns' "
+        "list, AND map the constraint to it in 'explicit_stats' (e.g. value_range: {'값': [0, 1]}). "
+        "NEVER leave 'columns' empty if a constraint is mentioned.\n\n"
         f"TRANSCRIPT:\n{transcript}"
     )
     columns, data_rows, req_stats, num_rows, explicit_stats = [], [], [], None, {}
